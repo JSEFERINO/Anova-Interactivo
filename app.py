@@ -694,6 +694,394 @@ def mostrar_informacion_datos(df, key_suffix):
 
 
 # ============================================================
+
+# ============================================================
+# DISEÑOS FACTORIALES FRACCIONADOS 2^(k-p) — MÓDULO CRIBADO
+# ============================================================
+
+def sugerir_generadores_fraccion(k, p):
+    """Busca generadores regulares con la mayor resolución posible (k<=8, p<=3)."""
+    import itertools
+    m = k - p
+    base = list("ABCDEFGH"[:m])
+    extra = list("ABCDEFGH"[m:k])
+    candidatos = [sum(1 << i for i in c)
+                  for r in range(1, m + 1)
+                  for c in itertools.combinations(range(m), r)]
+    mejor = None
+    for elegidos in itertools.combinations(candidatos, p):
+        longitudes = []
+        for mascara in range(1, 1 << p):
+            b = 0
+            for j in range(p):
+                if (mascara >> j) & 1:
+                    b ^= elegidos[j]
+            longitudes.append(b.bit_count() + mascara.bit_count())
+        puntaje = (min(longitudes), sum(longitudes),
+                   tuple(-x for x in sorted(longitudes)))
+        if mejor is None or puntaje > mejor[0]:
+            mejor = (puntaje, elegidos)
+    elegidos = mejor[1]
+    generadores = [
+        f"{extra[j]}=" + "".join(base[i] for i in range(m) if (elegidos[j] >> i) & 1)
+        for j in range(p)
+    ]
+    return generadores, mejor[0][0]
+
+
+def analizar_generadores_fraccion(generadores_txt, k, p):
+    """Valida generadores como E=ABCD. Solo admite RHS con factores básicos."""
+    import re
+    letras = list("ABCDEFGH"[:k])
+    base = set(letras[:k-p])
+    extras = set(letras[k-p:])
+    generadores = {}
+    lineas = [x.strip().upper().replace(" ", "") for x in generadores_txt.splitlines() if x.strip()]
+    if len(lineas) != p:
+        raise ValueError(f"Se requieren exactamente {p} generadores.")
+    for linea in lineas:
+        if "=" not in linea:
+            raise ValueError(f"Generador inválido: {linea}. Usa la forma E=ABCD.")
+        lhs, rhs = linea.split("=", 1)
+        if lhs not in extras:
+            raise ValueError(f"{lhs} debe ser uno de los factores generados: {', '.join(sorted(extras))}.")
+        if lhs in generadores:
+            raise ValueError(f"El generador {lhs} está repetido.")
+        if not rhs or any(ch not in base for ch in rhs):
+            raise ValueError(f"El lado derecho de {lhs} debe contener solo factores básicos ({''.join(sorted(base))}).")
+        if len(set(rhs)) != len(rhs):
+            raise ValueError(f"El generador {lhs} repite letras.")
+        generadores[lhs] = "".join(sorted(rhs, key=letras.index))
+    if set(generadores) != extras:
+        raise ValueError(f"Faltan generadores para: {', '.join(sorted(extras-set(generadores)))}.")
+    return generadores
+
+
+def palabras_definitorias_fraccion(generadores, k):
+    """Devuelve el subgrupo definitorio como máscaras binarias."""
+    letras = list("ABCDEFGH"[:k])
+    relaciones = []
+    for lhs, rhs in generadores.items():
+        mascara = 1 << letras.index(lhs)
+        for ch in rhs:
+            mascara ^= (1 << letras.index(ch))
+        relaciones.append(mascara)
+    palabras = {0}
+    for rel in relaciones:
+        palabras |= {x ^ rel for x in list(palabras)}
+    return sorted(palabras)
+
+
+def texto_efecto_mascara(mask, letras):
+    return "".join(letras[i] for i in range(len(letras)) if (mask >> i) & 1) or "I"
+
+
+def resolucion_fraccion(palabras):
+    longitudes = [int(x).bit_count() for x in palabras if x]
+    return min(longitudes) if longitudes else None
+
+
+def construir_estructura_alias(generadores, k, max_orden=2):
+    letras = list("ABCDEFGH"[:k])
+    definitorias = palabras_definitorias_fraccion(generadores, k)
+    efectos = []
+    import itertools
+    for orden in range(1, min(max_orden, k) + 1):
+        for comb in itertools.combinations(range(k), orden):
+            mask = sum(1 << i for i in comb)
+            alias_masks = sorted({mask ^ d for d in definitorias})
+            alias_txt = " = ".join(texto_efecto_mascara(x, letras) for x in alias_masks)
+            efectos.append({"Efecto": texto_efecto_mascara(mask, letras),
+                            "Estructura de alias": alias_txt,
+                            "Orden": orden})
+    return pd.DataFrame(efectos), definitorias
+
+
+def generar_diseno_fraccionado(factores, respuesta, p, generadores_txt,
+                               replicas=1, puntos_centro=0, randomizar=True, semilla=123):
+    """Genera la matriz 2^(k-p) y la traduce a niveles reales."""
+    import itertools
+    nombres = list(factores.keys())
+    k = len(nombres)
+    if k < 3 or k > 8:
+        raise ValueError("Para el módulo fraccionado se admiten entre 3 y 8 factores.")
+    if p < 1 or p >= k:
+        raise ValueError("p debe estar entre 1 y k-1.")
+    if p > 3:
+        raise ValueError("En esta versión se admiten fracciones hasta p=3.")
+    generadores = analizar_generadores_fraccion(generadores_txt, k, p)
+    letras = list("ABCDEFGH"[:k])
+    base_letras = letras[:k-p]
+    extras = letras[k-p:]
+    matriz_base = list(itertools.product([-1, 1], repeat=k-p))
+    filas_cod = []
+    for fila in matriz_base:
+        cod = dict(zip(base_letras, fila))
+        for extra in extras:
+            cod[extra] = int(np.prod([cod[x] for x in generadores[extra]]))
+        filas_cod.append(cod)
+
+    # Repeticiones completas del diseño base
+    filas = []
+    for rep in range(replicas):
+        for cod in filas_cod:
+            fila = {}
+            for j, nombre in enumerate(nombres):
+                niveles = factores[nombre]["niveles"]
+                bajo, alto = niveles[0], niveles[1]
+                valor = bajo if cod[letras[j]] == -1 else alto
+                try:
+                    valor = float(valor)
+                    if float(valor).is_integer(): valor = int(valor)
+                except Exception:
+                    pass
+                fila[nombre] = valor
+            fila[respuesta] = np.nan
+            filas.append(fila)
+
+    # Los puntos centrales se agregan solo para factores continuos numéricos.
+    if puntos_centro:
+        no_continuos = [n for n in nombres if factores[n].get("tipo") != "Continuo"]
+        no_numericos = []
+        for n in nombres:
+            try:
+                float(factores[n]["niveles"][0]); float(factores[n]["niveles"][1])
+            except Exception:
+                no_numericos.append(n)
+        if no_continuos or no_numericos:
+            raise ValueError("Los puntos centrales requieren que todos los factores sean continuos y tengan niveles numéricos.")
+        for _ in range(puntos_centro):
+            centro = {}
+            for n in nombres:
+                lo, hi = map(float, factores[n]["niveles"][:2])
+                centro[n] = (lo + hi) / 2
+            centro[respuesta] = np.nan
+            filas.append(centro)
+
+    df = pd.DataFrame(filas)
+    if randomizar:
+        df = df.sample(frac=1, random_state=semilla).reset_index(drop=True)
+    df.insert(0, "Corrida", np.arange(1, len(df) + 1))
+    meta = {
+        "k": k, "p": p, "n_base": 2 ** (k-p), "generadores": generadores,
+        "resolucion": resolucion_fraccion(palabras_definitorias_fraccion(generadores, k)),
+        "letras": letras, "base_letras": base_letras, "extras": extras,
+        "n_replicas": replicas, "puntos_centro": puntos_centro,
+        "randomizar": randomizar, "factores": nombres
+    }
+    return df, meta
+
+
+def codificar_factores_fraccion(df, factores_def, meta):
+    """Codifica niveles reales en -1/+1 y centros en 0."""
+    salida = pd.DataFrame(index=df.index)
+    letras = meta["letras"]
+    for j, nombre in enumerate(meta["factores"]):
+        lo, hi = factores_def[nombre]["niveles"][:2]
+        s = df[nombre]
+        try:
+            lo_n, hi_n = float(lo), float(hi)
+            vals = pd.to_numeric(s, errors="coerce")
+            cod = 2 * (vals - lo_n) / (hi_n - lo_n) - 1
+            cod = cod.where(vals.notna(), np.nan)
+        except Exception:
+            cod = s.map({str(lo): -1.0, str(hi): 1.0, lo: -1.0, hi: 1.0})
+        salida[letras[j]] = pd.to_numeric(cod, errors="coerce")
+    return salida
+
+
+def matriz_efectos_fraccion(codigos, max_orden=2):
+    import itertools
+    cols = {}
+    letras = list(codigos.columns)
+    for orden in range(1, min(max_orden, len(letras)) + 1):
+        for comb in itertools.combinations(letras, orden):
+            nombre = "".join(comb)
+            v = np.ones(len(codigos))
+            for letra in comb:
+                v = v * codigos[letra].to_numpy(dtype=float)
+            cols[nombre] = v
+    return pd.DataFrame(cols, index=codigos.index)
+
+
+def seleccionar_efectos_estimables(matriz, tolerancia=1e-9):
+    """Evita ajustar simultáneamente columnas perfectamente aliasadas."""
+    elegidos, descartados = [], []
+    for col in matriz.columns:
+        v = matriz[col].to_numpy(dtype=float)
+        if not np.isfinite(v).all() or np.std(v) < tolerancia:
+            descartados.append((col, "Sin variación o con valores faltantes"))
+            continue
+        duplicado = None
+        for prev in elegidos:
+            u = matriz[prev].to_numpy(dtype=float)
+            corr = np.corrcoef(v, u)[0, 1]
+            if np.isfinite(corr) and abs(abs(corr) - 1) < 1e-8:
+                duplicado = (prev, corr)
+                break
+        if duplicado:
+            descartados.append((col, f"Alias con {duplicado[0]} (r={duplicado[1]:.0f})"))
+        else:
+            elegidos.append(col)
+    return elegidos, descartados
+
+
+def mostrar_analisis_fraccionado(df_diseno, respuesta, factores_def, meta, alpha=0.05):
+    """Análisis tipo STATGRAPHICS: efectos, alias, correlaciones, ANOVA, Pareto y diagnóstico."""
+    st.markdown("## 1. Atributos del diseño")
+    res = meta["resolucion"]
+    etiqueta_res = {3:"III", 4:"IV", 5:"V", 6:"VI", 7:"VII", 8:"VIII"}.get(res, str(res))
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Diseño", f"2^{meta['k']}-{meta['p']}")
+    c2.metric("Corridas base", meta["n_base"])
+    c3.metric("Resolución", etiqueta_res)
+    c4.metric("Corridas ejecutadas", len(df_diseno))
+    st.write("**Generadores:** " + "; ".join(f"{k}={v}" for k,v in meta["generadores"].items()))
+    st.caption("La resolución se obtiene como la longitud mínima de las palabras no identidad de la relación definitoria.")
+
+    st.markdown("## 2. Estructura de alias")
+    alias_df, definitorias = construir_estructura_alias(meta["generadores"], meta["k"], 2)
+    st.dataframe(alias_df[["Efecto","Estructura de alias"]], use_container_width=True, hide_index=True)
+    palabras = [texto_efecto_mascara(x, meta["letras"]) for x in definitorias]
+    st.write("**Relación definitoria:** I = " + " = ".join(palabras[1:]))
+    st.caption("Los efectos unidos por el signo igual no pueden separarse con este diseño sin corridas adicionales o supuestos sobre efectos despreciables.")
+
+    codigos = codificar_factores_fraccion(df_diseno, factores_def, meta)
+    efectos = matriz_efectos_fraccion(codigos, 2)
+    st.markdown("## 3. Matriz de correlaciones de efectos")
+    corr = efectos.corr()
+    fig_corr = px.imshow(corr, text_auto=".2f", aspect="auto", color_continuous_scale="RdBu_r",
+                         zmin=-1, zmax=1, title="Correlaciones entre columnas de efectos")
+    fig_corr.update_layout(height=max(450, min(900, 24*len(corr.columns))))
+    st.plotly_chart(fig_corr, use_container_width=True)
+    st.caption("Valores cercanos a +1 o -1 indican columnas idénticas o confundidas; valores cercanos a 0 indican ortogonalidad entre columnas.")
+
+    st.markdown("## 4. Ajuste del modelo y tabla ANOVA")
+    datos = df_diseno.copy()
+    y = pd.to_numeric(datos[respuesta], errors="coerce")
+    validos = y.notna()
+    cod_validos = codigos.loc[validos].reset_index(drop=True)
+    y_validos = y.loc[validos].reset_index(drop=True)
+    if len(y_validos) < 3:
+        st.warning("Ingresa al menos tres respuestas observadas para ajustar el modelo.")
+        return
+    efectos_validos = matriz_efectos_fraccion(cod_validos, 2)
+    estimables, descartados = seleccionar_efectos_estimables(efectos_validos)
+    # Se reservan al menos 3 g.l. para error cuando el tamaño muestral lo permite,
+    # siguiendo la recomendación del manual de STATGRAPHICS.
+    max_terminos = max(0, len(y_validos) - 4)
+    if len(estimables) > max_terminos:
+        descartados.extend((e, "No incluido: se reservan grados de libertad para estimar el error") for e in estimables[max_terminos:])
+        estimables = estimables[:max_terminos]
+    if not estimables:
+        st.warning("No hay grados de libertad suficientes para estimar efectos y error. Agrega réplicas del diseño o puntos centrales y vuelve a ejecutar el análisis.")
+        return
+    df_modelo = pd.DataFrame({"Y_resp": y_validos})
+    nombres_modelo = {}
+    for j, efecto in enumerate(estimables):
+        nombre_col = f"E{j+1}"
+        df_modelo[nombre_col] = efectos_validos[efecto].to_numpy()
+        nombres_modelo[nombre_col] = efecto
+    formula = "Y_resp ~ " + " + ".join(nombres_modelo.keys())
+    modelo, anova = analizar_anova_mejorada(df_modelo, formula, "ANOVA del diseño fraccionado",
+                                            "fraccionado", "screening", 2)
+    if modelo is None:
+        return
+    anova_display = anova.copy()
+    anova_display.index = [nombres_modelo.get(str(x), str(x)) for x in anova_display.index]
+    st.dataframe(anova_display, use_container_width=True)
+    st.write(f"**R²:** {modelo.rsquared:.4f} · **R² ajustado:** {modelo.rsquared_adj:.4f} · **Desv. estándar residual:** {np.sqrt(modelo.mse_resid):.4f}")
+    if descartados:
+        with st.expander("Efectos no estimados separadamente"):
+            st.dataframe(pd.DataFrame(descartados, columns=["Efecto","Motivo"]), hide_index=True)
+
+    st.markdown("## 5. Efectos estimados y gráfico de Pareto")
+    filas_ef = []
+    gl = modelo.df_resid
+    tcrit = stats.t.ppf(1-alpha/2, gl) if gl > 0 else np.nan
+    for col, efecto in nombres_modelo.items():
+        beta = modelo.params.get(col, np.nan)
+        se = modelo.bse.get(col, np.nan)
+        tval = modelo.tvalues.get(col, np.nan)
+        pval = modelo.pvalues.get(col, np.nan)
+        filas_ef.append({"Efecto":efecto, "Estimación del efecto":2*beta,
+                         "Error estándar":2*se, "t":tval, "Valor-p":pval,
+                         "Significativo":bool(pval < alpha) if np.isfinite(pval) else False})
+    efectos_tabla = pd.DataFrame(filas_ef).sort_values("Valor-p")
+    st.dataframe(efectos_tabla, use_container_width=True, hide_index=True)
+    fig_p = px.bar(efectos_tabla.sort_values("Estimación del efecto", key=lambda s: s.abs()),
+                   x="Estimación del efecto", y="Efecto", orientation="h",
+                   color="Significativo", title="Pareto de efectos estimados (magnitud y signo)")
+    fig_p.update_layout(height=max(400, 28*len(efectos_tabla)))
+    st.plotly_chart(fig_p, use_container_width=True)
+    if gl > 0:
+        fig_t = px.bar(efectos_tabla.assign(Abs_t=efectos_tabla["t"].abs()).sort_values("Abs_t"),
+                       x="Abs_t", y="Efecto", orientation="h",
+                       title=f"Pareto estandarizado |t| (referencia t crítico = {tcrit:.3f})")
+        fig_t.add_vline(x=tcrit, line_dash="dash", line_color="red",
+                        annotation_text=f"α={alpha:.3f}")
+        st.plotly_chart(fig_t, use_container_width=True)
+
+    st.markdown("## 6. Diagnóstico del modelo")
+    resid = modelo.resid
+    ajust = modelo.fittedvalues
+    col1,col2 = st.columns(2)
+    with col1:
+        fig_r = px.scatter(x=ajust, y=resid, labels={"x":"Valores ajustados","y":"Residuales"},
+                           title="Residuales contra valores ajustados")
+        fig_r.add_hline(y=0, line_dash="dash")
+        st.plotly_chart(fig_r, use_container_width=True)
+    with col2:
+        qq = stats.probplot(resid, dist="norm")
+        fig_q = px.scatter(x=qq[0][0], y=qq[0][1], labels={"x":"Cuantiles normales","y":"Residuales ordenados"},
+                           title="Gráfico de probabilidad normal")
+        slope, intercept, _ = qq[1]
+        xx = np.asarray(qq[0][0])
+        fig_q.add_scatter(x=xx, y=intercept+slope*xx, mode="lines", name="Referencia")
+        st.plotly_chart(fig_q, use_container_width=True)
+
+    st.markdown("## 7. Gráficos de efectos principales")
+    for letra, nombre in zip(meta["letras"], meta["factores"]):
+        if letra in codigos.columns:
+            lo, hi = factores_def[nombre]["niveles"][:2]
+            vals = []
+            for nivel in [-1,1]:
+                fila = {x:0.0 for x in meta["letras"]}
+                fila[letra] = nivel
+                for col, efecto in nombres_modelo.items():
+                    fila[col] = np.prod([fila[x] for x in efecto])
+                pred = float(modelo.predict(pd.DataFrame([{col:fila[col] for col in nombres_modelo}]))[0])
+                vals.append({"Nivel":str(lo if nivel==-1 else hi),"Respuesta predicha":pred})
+            fig_m = px.line(pd.DataFrame(vals), x="Nivel", y="Respuesta predicha",
+                            markers=True, title=f"Efecto principal: {nombre}")
+            st.plotly_chart(fig_m, use_container_width=True)
+
+    st.markdown("## 8. Optimización exploratoria de la respuesta")
+    meta_obj = st.selectbox("Objetivo", ["Maximizar","Minimizar","Alcanzar un objetivo"], key="fr_objetivo")
+    objetivo = None
+    if meta_obj == "Alcanzar un objetivo":
+        objetivo = st.number_input("Valor objetivo", value=float(y_validos.mean()), key="fr_target")
+    import itertools
+    candidatos = []
+    for esquina in itertools.product([-1,1], repeat=meta["k"]):
+        fila_cod = dict(zip(meta["letras"], esquina))
+        xrow = {}
+        for col, efecto in nombres_modelo.items():
+            xrow[col] = float(np.prod([fila_cod[x] for x in efecto]))
+        pred = float(modelo.predict(pd.DataFrame([xrow]))[0])
+        candidatos.append((pred, esquina))
+    if meta_obj == "Maximizar": elegido = max(candidatos, key=lambda z:z[0])
+    elif meta_obj == "Minimizar": elegido = min(candidatos, key=lambda z:z[0])
+    else: elegido = min(candidatos, key=lambda z:abs(z[0]-objetivo))
+    st.metric("Respuesta predicha en el mejor vértice", f"{elegido[0]:.4f}")
+    opt_rows = []
+    for j,nombre in enumerate(meta["factores"]):
+        niveles = factores_def[nombre]["niveles"][:2]
+        opt_rows.append({"Factor":nombre,"Nivel seleccionado":niveles[0] if elegido[1][j]==-1 else niveles[1]})
+    st.dataframe(pd.DataFrame(opt_rows), use_container_width=True, hide_index=True)
+    st.warning("La optimización se realiza en los vértices del rango experimental y es exploratoria. No extrapoles fuera de los niveles estudiados; confirma experimentalmente la condición recomendada.")
+
+
 # WIZARD INTERACTIVO — APLICACIÓN INDEPENDIENTE
 # ============================================================
 
@@ -714,7 +1102,7 @@ st.caption(f"**Paso {st.session_state.wiz_paso} de 7**")
 if st.session_state.wiz_paso == 1:
     st.subheader("📋 Paso 1: Tipo de Diseño")
     opciones_diseno = {
-        "🔍 Screening (Factorial 2^k)": "screening", "📈 Superficie de Respuesta (MSR)": "rsm",
+        "🔍 Cribado / Factorial fraccionado 2^(k-p)": "screening", "📈 Superficie de Respuesta (MSR)": "rsm",
         "🔢 Factorial Multinivel": "multilevel", "🎯 Un Solo Factor (DCA)": "single_factor",
         "📊 Un Solo Factor con Bloques (DBCA)": "single_factor_block",
         "🔲 Cuadrado Latino (DCL)": "latin_square", "🔳 Cuadrado Greco-Latino (DCGL)": "greco_latin",
@@ -729,7 +1117,7 @@ if st.session_state.wiz_paso == 1:
 elif st.session_state.wiz_paso == 2:
     st.subheader("📋 Paso 2: Definición de Factores")
     tipo = st.session_state.wiz_tipo_diseno
-    n_factores = st.number_input("**Número de Factores:**", min_value=1, max_value=8, value=1 if tipo in ['single_factor', 'single_factor_block', 'latin_square', 'greco_latin'] else 3, step=1, key="wiz_n_factores")
+    n_factores = st.number_input("**Número de Factores:**", min_value=3 if tipo == "screening" else 1, max_value=8, value=1 if tipo in ['single_factor', 'single_factor_block', 'latin_square', 'greco_latin'] else 3, step=1, key="wiz_n_factores")
     factores_def = {}
     for i in range(n_factores):
         with st.expander(f"📌 Factor {chr(65+i)}", expanded=True):
@@ -794,12 +1182,32 @@ elif st.session_state.wiz_paso == 4:
         puntos_centro = st.number_input("**Puntos Centrales:**", min_value=0, max_value=10, value=0, step=1, key="wiz_puntos_centro")
     with col2:
         randomizar = st.checkbox("**Randomizar el orden de corrida**", value=True, key="wiz_randomizar")
+    if st.session_state.wiz_tipo_diseno == "screening":
+        st.markdown("### 🔬 Configuración de la fracción 2^(k-p)")
+        k_actual = len(st.session_state.wiz_factores)
+        p_max = min(3, k_actual - 1)
+        if p_max < 1:
+            st.warning("Define al menos dos factores adicionales en el paso anterior.")
+            p_fraccion = 1
+        else:
+            p_fraccion = st.selectbox("Orden de fracción (p)", list(range(1, p_max + 1)),
+                                      format_func=lambda p: f"2^(k-{p}) — {2**(k_actual-p)} corridas base",
+                                      key="wiz_p_fraccion")
+        sugeridos, res_sugerida = sugerir_generadores_fraccion(k_actual, p_fraccion)
+        texto_sugerido = "\\n".join(sugeridos)
+        generadores_txt = st.text_area("Generadores (puedes modificarlos)", value=texto_sugerido,
+                                       help="Un generador por línea. Ejemplo: E=ABCD. Las letras A, B, C... representan el orden de los factores definidos.",
+                                       key=f"wiz_generadores_{k_actual}_{p_fraccion}")
+        st.info(f"Generadores sugeridos para resolución {res_sugerida}. La resolución definitiva se calculará al generar el diseño.")
+        st.caption("La fracción reduce el número de corridas, pero introduce aliasado. Revisa la estructura de alias antes de ejecutar el experimento.")
+    else:
+        p_fraccion, generadores_txt = 0, ""
     col_btn1, col_btn2 = st.columns([1, 1])
     with col_btn1:
         if st.button("⬅️ Atrás", key="wiz_back_4"): st.session_state.wiz_paso = 3; st.rerun()
     with col_btn2:
         if st.button("🎲 Generar Diseño", key="wiz_generar"):
-            st.session_state.wiz_config = {'n_replicas': n_replicas, 'puntos_centro': puntos_centro, 'randomizar': randomizar}
+            st.session_state.wiz_config = {'n_replicas': n_replicas, 'puntos_centro': puntos_centro, 'randomizar': randomizar, 'p_fraccion': p_fraccion, 'generadores_txt': generadores_txt}
             st.session_state.wiz_datos = None; st.session_state.wiz_paso = 5; st.rerun()
 
 # PASO 5
@@ -808,7 +1216,13 @@ elif st.session_state.wiz_paso == 5:
     if st.session_state.wiz_datos is None:
         factores, resp, config, tipo = st.session_state.wiz_factores, st.session_state.wiz_respuesta, st.session_state.wiz_config, st.session_state.wiz_tipo_diseno
         try:
-            if tipo in ['screening', 'multilevel', 'rsm']:
+            if tipo == 'screening':
+                df_diseno, meta_fr = generar_diseno_fraccionado(
+                    factores, resp, config.get('p_fraccion', 1), config.get('generadores_txt', ''),
+                    replicas=config['n_replicas'], puntos_centro=config['puntos_centro'],
+                    randomizar=config['randomizar'])
+                st.session_state.wiz_fr_meta = meta_fr
+            elif tipo in ['multilevel', 'rsm']:
                 df_diseno = crear_diseno_completo(factores, {resp: {'valores': None}}, n_replicas=config['n_replicas'], randomize=config['randomizar'])
             elif tipo in ['single_factor', 'single_factor_block']:
                 factor_principal = [f for f, v in factores.items() if not v.get('es_bloque', False)]
@@ -848,6 +1262,9 @@ elif st.session_state.wiz_paso == 5:
     if st.session_state.wiz_datos is not None:
         df_diseno = st.session_state.wiz_datos
         st.success(f"✅ Diseño generado: {len(df_diseno)} corridas")
+        if st.session_state.wiz_tipo_diseno == "screening" and st.session_state.get("wiz_fr_meta"):
+            meta_fr = st.session_state.wiz_fr_meta
+            st.info(f"Diseño 2^{meta_fr['k']}-{meta_fr['p']} · {meta_fr['n_base']} corridas base · Resolución {meta_fr['resolucion']} · Generadores: " + "; ".join(f"{a}={b}" for a,b in meta_fr['generadores'].items()))
         st.dataframe(df_diseno, use_container_width=True)
         st.download_button("📥 Descargar Diseño (vacío)", data=df_diseno.to_csv(index=False).encode('utf-8'), file_name="diseno_vacio.csv", mime="text/csv")
         st.subheader("✏️ Editar datos manualmente")
@@ -910,7 +1327,14 @@ elif st.session_state.wiz_paso == 7:
     df_analisis = df_diseno.copy().reset_index(drop=True)
     try:
         tipo_anova = st.session_state.get('wiz_tipo_anova', 1)
-        if tipo in ['screening', 'multilevel', 'rsm']:
+        if tipo == 'screening':
+            meta_fr = st.session_state.get('wiz_fr_meta')
+            if not meta_fr:
+                st.error("No se encontró la configuración del diseño fraccionado. Regresa al paso 4 y genera nuevamente el diseño.")
+            else:
+                alpha_fr = st.slider("Nivel de significancia α", 0.01, 0.10, 0.05, 0.01, key="fr_alpha")
+                mostrar_analisis_fraccionado(df_analisis, resp, factores_def, meta_fr, alpha_fr)
+        elif tipo in ['multilevel', 'rsm']:
             for f in factores_reales: df_analisis[f] = df_analisis[f].astype('category')
             if tipo == 'rsm':
                 vars_list = factor_principal
@@ -1075,7 +1499,7 @@ elif st.session_state.wiz_paso == 7:
     with col_btn2:
         if st.button("🔄 Nuevo Diseño", key="wiz_nuevo"):
             st.session_state.wiz_paso = 1; st.session_state.wiz_tipo_diseno = None; st.session_state.wiz_factores = {}
-            st.session_state.wiz_respuesta = None; st.session_state.wiz_datos = None; st.session_state.wiz_config = {}
+            st.session_state.wiz_respuesta = None; st.session_state.wiz_datos = None; st.session_state.wiz_config = {}; st.session_state.wiz_fr_meta = None
             st.rerun()
 
 # ============================================================
