@@ -699,28 +699,52 @@ def mostrar_informacion_datos(df, key_suffix):
 # DISEÑOS FACTORIALES FRACCIONADOS 2^(k-p) — MÓDULO CRIBADO
 # ============================================================
 
+def rango_generadores_gf2(vectores):
+    """Rango de vectores binarios representados como enteros (álgebra GF(2))."""
+    pivotes = {}
+    for valor in vectores:
+        x = int(valor)
+        while x:
+            pivote = x.bit_length() - 1
+            if pivote in pivotes:
+                x ^= pivotes[pivote]
+            else:
+                pivotes[pivote] = x
+                break
+    return len(pivotes)
+
+
 def sugerir_generadores_fraccion(k, p):
-    """Busca generadores regulares con la mayor resolución posible (k<=8, p<=3)."""
+    """Busca generadores regulares linealmente independientes y prioriza resolución."""
     import itertools
+    if not (1 <= p <= min(4, k // 2)):
+        raise ValueError(f"Para k={k}, el orden p debe estar entre 1 y {min(4, k // 2)}.")
     m = k - p
     base = list("ABCDEFGH"[:m])
     extra = list("ABCDEFGH"[m:k])
-    candidatos = [sum(1 << i for i in c)
-                  for r in range(1, m + 1)
-                  for c in itertools.combinations(range(m), r)]
+    candidatos = [
+        sum(1 << i for i in c)
+        for r in range(1, m + 1)
+        for c in itertools.combinations(range(m), r)
+    ]
     mejor = None
     for elegidos in itertools.combinations(candidatos, p):
+        # Los p generadores deben ser independientes; si no, la fracción
+        # tendría menos de 2^(k-p) corridas distintas.
+        if rango_generadores_gf2(elegidos) != p:
+            continue
         longitudes = []
         for mascara in range(1, 1 << p):
-            b = 0
+            palabra = 0
             for j in range(p):
                 if (mascara >> j) & 1:
-                    b ^= elegidos[j]
-            longitudes.append(b.bit_count() + mascara.bit_count())
-        puntaje = (min(longitudes), sum(longitudes),
-                   tuple(-x for x in sorted(longitudes)))
+                    palabra ^= elegidos[j]
+            longitudes.append(palabra.bit_count() + mascara.bit_count())
+        puntaje = (min(longitudes), sum(longitudes), tuple(-x for x in sorted(longitudes)))
         if mejor is None or puntaje > mejor[0]:
             mejor = (puntaje, elegidos)
+    if mejor is None:
+        raise ValueError("No fue posible construir generadores independientes para esta fracción.")
     elegidos = mejor[1]
     generadores = [
         f"{extra[j]}=" + "".join(base[i] for i in range(m) if (elegidos[j] >> i) & 1)
@@ -730,17 +754,27 @@ def sugerir_generadores_fraccion(k, p):
 
 
 def analizar_generadores_fraccion(generadores_txt, k, p):
-    """Valida generadores como E=ABCD. Solo admite RHS con factores básicos."""
+    """Valida exactamente p generadores, aceptando saltos reales o '\\\\n' literales."""
     import re
     letras = list("ABCDEFGH"[:k])
     base = set(letras[:k-p])
     extras = set(letras[k-p:])
+
+    # Streamlit puede conservar en el textarea los dos caracteres '\\\\n'
+    # cuando una versión previa construyó el valor sugerido incorrectamente.
+    texto = str(generadores_txt or "")
+    texto = texto.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+    lineas = [x.strip().upper().replace(" ", "").replace("\\t", "")
+              for x in re.split(r"[\r\n;]+", texto) if x.strip()]
     generadores = {}
-    lineas = [x.strip().upper().replace(" ", "") for x in generadores_txt.splitlines() if x.strip()]
     if len(lineas) != p:
-        raise ValueError(f"Se requieren exactamente {p} generadores.")
+        raise ValueError(
+            f"Se requieren exactamente {p} generadores independientes; "
+            f"se detectaron {len(lineas)}. Escribe uno por línea."
+        )
+    vectores = []
     for linea in lineas:
-        if "=" not in linea:
+        if linea.count("=") != 1:
             raise ValueError(f"Generador inválido: {linea}. Usa la forma E=ABCD.")
         lhs, rhs = linea.split("=", 1)
         if lhs not in extras:
@@ -751,9 +785,17 @@ def analizar_generadores_fraccion(generadores_txt, k, p):
             raise ValueError(f"El lado derecho de {lhs} debe contener solo factores básicos ({''.join(sorted(base))}).")
         if len(set(rhs)) != len(rhs):
             raise ValueError(f"El generador {lhs} repite letras.")
-        generadores[lhs] = "".join(sorted(rhs, key=letras.index))
+        rhs_ordenado = "".join(sorted(rhs, key=letras.index))
+        generadores[lhs] = rhs_ordenado
+        vectores.append(sum(1 << letras.index(ch) for ch in rhs_ordenado))
     if set(generadores) != extras:
-        raise ValueError(f"Faltan generadores para: {', '.join(sorted(extras-set(generadores)))}.")
+        faltan = sorted(extras - set(generadores))
+        raise ValueError(f"Faltan generadores para: {', '.join(faltan)}.")
+    if rango_generadores_gf2(vectores) != p:
+        raise ValueError(
+            "Los generadores no son independientes en GF(2). "
+            "Modifica las combinaciones para obtener exactamente 2^(k-p) corridas distintas."
+        )
     return generadores
 
 
@@ -805,10 +847,8 @@ def generar_diseno_fraccionado(factores, respuesta, p, generadores_txt,
     k = len(nombres)
     if k < 3 or k > 8:
         raise ValueError("Para el módulo fraccionado se admiten entre 3 y 8 factores.")
-    if p < 1 or p >= k:
-        raise ValueError("p debe estar entre 1 y k-1.")
-    if p > 3:
-        raise ValueError("En esta versión se admiten fracciones hasta p=3.")
+    if p < 1 or p > min(4, k // 2):
+        raise ValueError(f"Para k={k}, el orden p debe estar entre 1 y {min(4, k // 2)}; se requieren al menos p factores básicos.")
     generadores = analizar_generadores_fraccion(generadores_txt, k, p)
     letras = list("ABCDEFGH"[:k])
     base_letras = letras[:k-p]
@@ -1102,12 +1142,16 @@ st.caption(f"**Paso {st.session_state.wiz_paso} de 7**")
 if st.session_state.wiz_paso == 1:
     st.subheader("📋 Paso 1: Tipo de Diseño")
     opciones_diseno = {
-        "🔍 Cribado / Factorial fraccionado 2^(k-p)": "screening", "📈 Superficie de Respuesta (MSR)": "rsm",
+        "🔍 Cribado — Factorial completo 2^k": "screening_full",
+        "🔬 Cribado — Factorial fraccionado 2^(k-p)": "screening_fractional",
+        "📈 Superficie de Respuesta (MSR)": "rsm",
         "🔢 Factorial Multinivel": "multilevel", "🎯 Un Solo Factor (DCA)": "single_factor",
         "📊 Un Solo Factor con Bloques (DBCA)": "single_factor_block",
         "🔲 Cuadrado Latino (DCL)": "latin_square", "🔳 Cuadrado Greco-Latino (DCGL)": "greco_latin",
     }
-    tipo = st.radio("**Design Class:**", list(opciones_diseno.keys()), key="wiz_tipo_radio")
+    st.markdown("### 🔍 Opciones de cribado")
+    st.caption("Elige entre conservar todas las combinaciones 2^k o reducir corridas mediante una fracción regular 2^(k-p).")
+    tipo = st.radio("**Clase de diseño:**", list(opciones_diseno.keys()), key="wiz_tipo_radio")
     if st.button("➡️ Siguiente Paso", key="wiz_next_1"):
         st.session_state.wiz_tipo_diseno = opciones_diseno[tipo]
         st.session_state.wiz_paso = 2
@@ -1117,13 +1161,20 @@ if st.session_state.wiz_paso == 1:
 elif st.session_state.wiz_paso == 2:
     st.subheader("📋 Paso 2: Definición de Factores")
     tipo = st.session_state.wiz_tipo_diseno
-    n_factores = st.number_input("**Número de Factores:**", min_value=3 if tipo == "screening" else 1, max_value=8, value=1 if tipo in ['single_factor', 'single_factor_block', 'latin_square', 'greco_latin'] else 3, step=1, key="wiz_n_factores")
+    es_cribado = tipo in ("screening", "screening_full", "screening_fractional")
+    n_factores = st.number_input("**Número de Factores:**", min_value=3 if es_cribado else 1, max_value=8, value=3 if es_cribado else (1 if tipo in ['single_factor', 'single_factor_block', 'latin_square', 'greco_latin'] else 3), step=1, key="wiz_n_factores")
     factores_def = {}
     for i in range(n_factores):
         with st.expander(f"📌 Factor {chr(65+i)}", expanded=True):
             col1, col2, col3 = st.columns([2, 1, 1])
             with col1: nombre = st.text_input(f"Nombre del Factor {chr(65+i)}:", value=f"Factor_{chr(65+i)}", key=f"wiz_nombre_{i}")
-            with col2: n_niveles = st.number_input(f"Niveles:", min_value=2, max_value=10, value=2 if tipo in ['screening', 'rsm'] else 3, step=1, key=f"wiz_niveles_{i}")
+            with col2:
+                max_niveles = 2 if es_cribado else 10
+                n_niveles = st.number_input(
+                    "Niveles:", min_value=2, max_value=max_niveles,
+                    value=2 if es_cribado or tipo == "rsm" else 3,
+                    step=1, key=f"wiz_niveles_{i}"
+                )
             with col3: tipo_var = st.selectbox("Tipo:", ["Continuo", "Categórico"], key=f"wiz_tipo_{i}")
             niveles = []
             if tipo_var == "Continuo" and n_niveles == 2:
@@ -1182,10 +1233,12 @@ elif st.session_state.wiz_paso == 4:
         puntos_centro = st.number_input("**Puntos Centrales:**", min_value=0, max_value=10, value=0, step=1, key="wiz_puntos_centro")
     with col2:
         randomizar = st.checkbox("**Randomizar el orden de corrida**", value=True, key="wiz_randomizar")
-    if st.session_state.wiz_tipo_diseno == "screening":
+    if st.session_state.wiz_tipo_diseno in ("screening", "screening_fractional"):
         st.markdown("### 🔬 Configuración de la fracción 2^(k-p)")
         k_actual = len(st.session_state.wiz_factores)
-        p_max = min(3, k_actual - 1)
+        # Para p generadores independientes se requieren al menos p factores básicos:
+        # p <= k-p. Así, p=4 solo es admisible desde k=8.
+        p_max = min(4, k_actual // 2)
         if p_max < 1:
             st.warning("Define al menos dos factores adicionales en el paso anterior.")
             p_fraccion = 1
@@ -1194,12 +1247,20 @@ elif st.session_state.wiz_paso == 4:
                                       format_func=lambda p: f"2^(k-{p}) — {2**(k_actual-p)} corridas base",
                                       key="wiz_p_fraccion")
         sugeridos, res_sugerida = sugerir_generadores_fraccion(k_actual, p_fraccion)
-        texto_sugerido = "\\n".join(sugeridos)
-        generadores_txt = st.text_area("Generadores (puedes modificarlos)", value=texto_sugerido,
-                                       help="Un generador por línea. Ejemplo: E=ABCD. Las letras A, B, C... representan el orden de los factores definidos.",
-                                       key=f"wiz_generadores_{k_actual}_{p_fraccion}")
+        texto_sugerido = "\n".join(sugeridos)
+        key_generadores = f"wiz_generadores_{k_actual}_{p_fraccion}"
+        if key_generadores in st.session_state:
+            st.session_state[key_generadores] = str(st.session_state[key_generadores]).replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+        generadores_txt = st.text_area("Generadores (un generador por línea)", value=texto_sugerido,
+                                       help="Se requieren exactamente p generadores independientes. Ejemplo: para p=2 escribe C=AB y D=AC, cada uno en una línea.",
+                                       key=key_generadores)
         st.info(f"Generadores sugeridos para resolución {res_sugerida}. La resolución definitiva se calculará al generar el diseño.")
         st.caption("La fracción reduce el número de corridas, pero introduce aliasado. Revisa la estructura de alias antes de ejecutar el experimento.")
+    elif st.session_state.wiz_tipo_diseno == "screening_full":
+        st.markdown("### 🔍 Cribado factorial completo 2^k")
+        k_completo = len(st.session_state.wiz_factores)
+        st.info(f"Se generarán las {2**k_completo} combinaciones completas de los {k_completo} factores, antes de réplicas y puntos centrales. No se aplicará fraccionamiento ni aliasado estructural.")
+        p_fraccion, generadores_txt = 0, ""
     else:
         p_fraccion, generadores_txt = 0, ""
     col_btn1, col_btn2 = st.columns([1, 1])
@@ -1216,12 +1277,20 @@ elif st.session_state.wiz_paso == 5:
     if st.session_state.wiz_datos is None:
         factores, resp, config, tipo = st.session_state.wiz_factores, st.session_state.wiz_respuesta, st.session_state.wiz_config, st.session_state.wiz_tipo_diseno
         try:
-            if tipo == 'screening':
+            if tipo in ('screening', 'screening_fractional'):
                 df_diseno, meta_fr = generar_diseno_fraccionado(
                     factores, resp, config.get('p_fraccion', 1), config.get('generadores_txt', ''),
                     replicas=config['n_replicas'], puntos_centro=config['puntos_centro'],
                     randomizar=config['randomizar'])
                 st.session_state.wiz_fr_meta = meta_fr
+            elif tipo == 'screening_full':
+                if any(len(v.get('niveles', [])) != 2 for v in factores.values()):
+                    raise ValueError("El cribado factorial completo 2^k requiere exactamente dos niveles por factor.")
+                df_diseno = crear_diseno_completo(
+                    factores, {resp: {'valores': None}},
+                    n_replicas=config['n_replicas'], randomize=config['randomizar']
+                )
+                st.session_state.wiz_fr_meta = None
             elif tipo in ['multilevel', 'rsm']:
                 df_diseno = crear_diseno_completo(factores, {resp: {'valores': None}}, n_replicas=config['n_replicas'], randomize=config['randomizar'])
             elif tipo in ['single_factor', 'single_factor_block']:
@@ -1251,20 +1320,33 @@ elif st.session_state.wiz_paso == 5:
                     df_diseno = pd.DataFrame(filas)
             else:
                 df_diseno = crear_diseno_completo(factores, {resp: {'valores': None}}, n_replicas=config['n_replicas'], randomize=config['randomizar'])
-            if config.get('puntos_centro', 0) > 0:
-                for _ in range(config['puntos_centro']):
-                    fila_centro = {f: v['niveles'][0] for f, v in factores.items() if not v.get('es_bloque', False)}
-                    fila_centro[resp] = None
-                    df_diseno = pd.concat([df_diseno, pd.DataFrame([fila_centro])], ignore_index=True)
+            if config.get('puntos_centro', 0) > 0 and tipo not in ('screening', 'screening_fractional'):
+                factores_centro = {f: v for f, v in factores.items() if not v.get('es_bloque', False)}
+                fila_centro = {}
+                for f, v in factores_centro.items():
+                    if v.get('tipo') != 'Continuo' or len(v.get('niveles', [])) != 2:
+                        raise ValueError("Los puntos centrales requieren factores continuos con dos niveles numéricos.")
+                    try:
+                        bajo, alto = map(float, v['niveles'][:2])
+                    except Exception:
+                        raise ValueError(f"Los niveles de {f} deben ser numéricos para calcular puntos centrales.")
+                    fila_centro[f] = (bajo + alto) / 2
+                fila_centro[resp] = np.nan
+                centros = pd.DataFrame([fila_centro] * int(config['puntos_centro']))
+                df_diseno = pd.concat([df_diseno, centros], ignore_index=True)
             st.session_state.wiz_datos = df_diseno
         except Exception as e: st.error(f"❌ Error al generar el diseño: {str(e)}")
 
     if st.session_state.wiz_datos is not None:
         df_diseno = st.session_state.wiz_datos
         st.success(f"✅ Diseño generado: {len(df_diseno)} corridas")
-        if st.session_state.wiz_tipo_diseno == "screening" and st.session_state.get("wiz_fr_meta"):
+        tipo_actual = st.session_state.wiz_tipo_diseno
+        if tipo_actual in ("screening", "screening_fractional") and st.session_state.get("wiz_fr_meta"):
             meta_fr = st.session_state.wiz_fr_meta
-            st.info(f"Diseño 2^{meta_fr['k']}-{meta_fr['p']} · {meta_fr['n_base']} corridas base · Resolución {meta_fr['resolucion']} · Generadores: " + "; ".join(f"{a}={b}" for a,b in meta_fr['generadores'].items()))
+            st.info(f"Diseño 2^({meta_fr['k']}-{meta_fr['p']}) · {meta_fr['n_base']} corridas base · Resolución {meta_fr['resolucion']} · {meta_fr['p']} generadores: " + "; ".join(f"{a}={b}" for a,b in meta_fr['generadores'].items()))
+        elif tipo_actual == "screening_full":
+            k_completo = len(st.session_state.wiz_factores)
+            st.info(f"Diseño factorial completo 2^{k_completo} · {2**k_completo} combinaciones base · Sin fraccionamiento.")
         st.dataframe(df_diseno, use_container_width=True)
         st.download_button("📥 Descargar Diseño (vacío)", data=df_diseno.to_csv(index=False).encode('utf-8'), file_name="diseno_vacio.csv", mime="text/csv")
         st.subheader("✏️ Editar datos manualmente")
@@ -1327,20 +1409,23 @@ elif st.session_state.wiz_paso == 7:
     df_analisis = df_diseno.copy().reset_index(drop=True)
     try:
         tipo_anova = st.session_state.get('wiz_tipo_anova', 1)
-        if tipo == 'screening':
+        if tipo in ('screening', 'screening_fractional'):
             meta_fr = st.session_state.get('wiz_fr_meta')
             if not meta_fr:
                 st.error("No se encontró la configuración del diseño fraccionado. Regresa al paso 4 y genera nuevamente el diseño.")
             else:
                 alpha_fr = st.slider("Nivel de significancia α", 0.01, 0.10, 0.05, 0.01, key="fr_alpha")
                 mostrar_analisis_fraccionado(df_analisis, resp, factores_def, meta_fr, alpha_fr)
-        elif tipo in ['multilevel', 'rsm']:
+        elif tipo in ['multilevel', 'rsm', 'screening_full']:
             for f in factores_reales: df_analisis[f] = df_analisis[f].astype('category')
             if tipo == 'rsm':
                 vars_list = factor_principal
                 formula = f'{resp} ~ ' + ' + '.join(vars_list) + ' + ' + ' + '.join([f'I({v}**2)' for v in vars_list])
                 if len(vars_list) >= 2: formula += ' + ' + ' + '.join([f'{vars_list[i]}:{vars_list[j]}' for i in range(len(vars_list)) for j in range(i+1, len(vars_list))])
-            else: formula = f'{resp} ~ ' + ' * '.join(factor_principal)
+            elif tipo == 'screening_full':
+                formula = f'{resp} ~ ' + ' * '.join([f'C({v})' for v in factor_principal])
+            else:
+                formula = f'{resp} ~ ' + ' * '.join(factor_principal)
             modelo, anova = analizar_anova_mejorada(df_analisis, formula, "ANOVA Wizard", "wizard", "wizard", tipo_anova)
 
             if modelo is not None:
